@@ -145,7 +145,7 @@ def get_instant_subtitles(
 
 
 def get_ydl_base_opts() -> Dict[str, Any]:
-    """Base yt-dlp configuration with security, timeouts, and JS runtime support."""
+    """Base yt-dlp configuration with security, timeouts, client emulation, and JS runtime support."""
     opts: Dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
@@ -153,6 +153,16 @@ def get_ydl_base_opts() -> Dict[str, Any]:
         "socket_timeout": 20,
         "nocheckcertificate": True,
         "noplaylist": True,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        # Use android, ios, mweb clients to bypass YouTube 403 Forbidden streaming blocks on datacenter IPs
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "mweb", "web"],
+            }
+        },
     }
 
     # Enable Node.js JS runtime if node is in PATH
@@ -203,84 +213,110 @@ def get_video_info(url_or_id: str) -> Dict[str, Any]:
         raise YouTubeError("An error occurred while fetching video details.")
 
 
-def _find_matching_track(caption_dict: Dict[str, List[Dict[str, Any]]], preferred_lang: str = "en") -> Optional[Tuple[str, Dict[str, Any]]]:
+def _get_candidate_tracks(caption_dict: Dict[str, List[Dict[str, Any]]], preferred_lang: str = "en") -> List[Tuple[str, Dict[str, Any]]]:
     """
-    Find the best subtitle format for the preferred language code.
-    Checks exact matches (e.g., 'en'), locale prefixes (e.g., 'en-US', 'en-orig'),
-    or falls back to the first available language track.
+    Rank and return all available subtitle tracks in priority order:
+    1. Preferred language native/master track (no 'tlang=' in URL)
+    2. Preferred language auto-translated track
+    3. Master original language tracks (no 'tlang=' in URL or lang code ending in '-orig')
+    4. Any other available language tracks
     Prefers json3 format, followed by vtt, srv3, and srt.
     """
     if not caption_dict:
-        return None
-
-    # Step 1: Look for exact or prefix matches for preferred_lang
-    candidate_langs = []
-    preferred_lower = preferred_lang.lower()
-
-    # Exact match first
-    for lang in caption_dict.keys():
-        if lang.lower() == preferred_lower:
-            candidate_langs.insert(0, lang)
-        elif lang.lower().startswith(f"{preferred_lower}-") or lang.lower().startswith(f"{preferred_lower}."):
-            candidate_langs.append(lang)
-
-    # If no preferred language track, consider all available languages
-    if not candidate_langs:
-        candidate_langs = list(caption_dict.keys())
+        return []
 
     format_preference = ["json3", "vtt", "srv3", "srv1", "ttml", "srt"]
 
-    for lang in candidate_langs:
-        formats = caption_dict.get(lang, [])
+    def fmt_rank(f: Dict[str, Any]) -> int:
+        ext = f.get("ext", "").lower()
+        if ext in format_preference:
+            return format_preference.index(ext)
+        return len(format_preference) + 1
+
+    preferred_lower = preferred_lang.lower()
+    pref_native: List[Tuple[str, Dict[str, Any]]] = []
+    pref_translated: List[Tuple[str, Dict[str, Any]]] = []
+    master_native: List[Tuple[str, Dict[str, Any]]] = []
+    others: List[Tuple[str, Dict[str, Any]]] = []
+
+    for lang, formats in caption_dict.items():
         if not formats:
             continue
+        sorted_fmts = sorted(formats, key=fmt_rank)
+        for fmt in sorted_fmts:
+            url = fmt.get("url")
+            if not url:
+                continue
+            is_translated = "tlang=" in url
+            is_pref = (lang.lower() == preferred_lower or 
+                       lang.lower().startswith(f"{preferred_lower}-") or 
+                       lang.lower().startswith(f"{preferred_lower}."))
+            
+            if is_pref and not is_translated:
+                pref_native.append((lang, fmt))
+            elif is_pref and is_translated:
+                pref_translated.append((lang, fmt))
+            elif not is_translated or lang.endswith("-orig"):
+                master_native.append((lang, fmt))
+            else:
+                others.append((lang, fmt))
+            break  # pick best format per language
 
-        # Sort formats by format_preference index
-        def fmt_rank(f: Dict[str, Any]) -> int:
-            ext = f.get("ext", "").lower()
-            if ext in format_preference:
-                return format_preference.index(ext)
-            return len(format_preference) + 1
-
-        sorted_formats = sorted(formats, key=fmt_rank)
-        for fmt in sorted_formats:
-            if fmt.get("url"):
-                return lang, fmt
-
-    return None
+    return pref_native + pref_translated + master_native + others
 
 
 def _download_and_parse_subtitle(track_info: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Download subtitle data directly via HTTP and parse into segments."""
+    """Download subtitle data directly via HTTP and parse into segments with auto-fallback."""
     url = track_info.get("url")
     ext = track_info.get("ext", "").lower()
     if not url:
         return []
 
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-    )
+    def fetch_url(target_url: str) -> Optional[str]:
+        req = urllib.request.Request(
+            target_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                "Referer": "https://www.youtube.com/",
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            logger.debug(f"HTTPError {e.code} fetching subtitles from {target_url[:60]}")
+            return None
+        except Exception as e:
+            logger.debug(f"Error fetching subtitles: {e}")
+            return None
 
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            content = resp.read().decode("utf-8", errors="replace")
+    content = fetch_url(url)
 
-        if ext == "json3" or "timedtext" in url:
-            try:
-                data = json.loads(content)
-                if isinstance(data, dict) and "events" in data:
-                    return parse_json3_content(data)
-            except Exception:
-                # If json parsing fails, try vtt parser
-                pass
+    # If fetching failed and URL contained auto-translation (tlang=), strip tlang parameter to get the original spoken track!
+    if not content and "tlang=" in url:
+        try:
+            parsed = urllib.parse.urlparse(url)
+            qs = urllib.parse.parse_qs(parsed.query)
+            qs.pop("tlang", None)
+            clean_query = urllib.parse.urlencode(qs, doseq=True)
+            fallback_url = urllib.parse.urlunparse(parsed._replace(query=clean_query))
+            logger.info("Retrying subtitle fetch by removing tlang parameter...")
+            content = fetch_url(fallback_url)
+        except Exception as err:
+            logger.debug(f"Failed to strip tlang parameter: {err}")
 
-        return parse_vtt_content(content)
-    except Exception as e:
-        logger.warning(f"Failed to download/parse subtitle track from {url[:60]}: {e}")
+    if not content:
         return []
+
+    if ext == "json3" or "timedtext" in url:
+        try:
+            data = json.loads(content)
+            if isinstance(data, dict) and "events" in data:
+                return parse_json3_content(data)
+        except Exception:
+            pass
+
+    return parse_vtt_content(content)
 
 
 def extract_youtube_subtitles(info: Dict[str, Any], preferred_lang: str = "en") -> Optional[Tuple[List[Dict[str, Any]], str, str]]:
@@ -288,16 +324,14 @@ def extract_youtube_subtitles(info: Dict[str, Any], preferred_lang: str = "en") 
     Subtitle-First Strategy:
     1. Check for manually created subtitles ('subtitles')
     2. Check for automatically generated subtitles ('automatic_captions')
-    3. Return None if no usable subtitles are found.
+    3. Iterate through candidate tracks until a usable track is downloaded.
     
     Returns:
         (segments, language_code, "youtube_subtitles") or None
     """
     # 1. Check manually created subtitles
     manual_subs = info.get("subtitles") or {}
-    matched = _find_matching_track(manual_subs, preferred_lang)
-    if matched:
-        lang, track_info = matched
+    for lang, track_info in _get_candidate_tracks(manual_subs, preferred_lang):
         segments = _download_and_parse_subtitle(track_info)
         if segments:
             logger.info(f"Successfully extracted {len(segments)} segments from manual subtitles ({lang})")
@@ -305,9 +339,7 @@ def extract_youtube_subtitles(info: Dict[str, Any], preferred_lang: str = "en") 
 
     # 2. Check automatically generated subtitles
     auto_subs = info.get("automatic_captions") or {}
-    matched = _find_matching_track(auto_subs, preferred_lang)
-    if matched:
-        lang, track_info = matched
+    for lang, track_info in _get_candidate_tracks(auto_subs, preferred_lang):
         segments = _download_and_parse_subtitle(track_info)
         if segments:
             logger.info(f"Successfully extracted {len(segments)} segments from auto captions ({lang})")
@@ -324,7 +356,7 @@ def download_audio(
 ) -> str:
     """
     Download only the audio stream of a YouTube video as an optimized MP3 file.
-    Does NOT download the full video.
+    Uses android/ios player clients and format fallback to avoid HTTP 403 Forbidden.
     Returns:
         Absolute filepath to the downloaded audio file.
     """
@@ -341,7 +373,7 @@ def download_audio(
 
     ydl_opts = get_ydl_base_opts()
     ydl_opts.update({
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "format": "ba[ext=m4a]/ba/b/18/best",
         "outtmpl": out_template,
         "progress_hooks": [ydl_progress_hook],
         "postprocessors": [{
@@ -357,7 +389,6 @@ def download_audio(
             video_id = res.get("id")
 
             # Find the downloaded file
-            # Since FFmpegExtractAudio converts to .mp3, check output_dir for matches
             for fname in os.listdir(output_dir):
                 if fname.startswith(f"{video_id}_") and fname.endswith(".mp3"):
                     return os.path.abspath(os.path.join(output_dir, fname))
@@ -370,7 +401,13 @@ def download_audio(
             raise YouTubeError("Audio was downloaded but the output file could not be located.")
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"Failed to download audio for {canonical_url}: {e}")
-        raise YouTubeError(f"Audio download failed: {clean_caption_text(str(e))}")
+        err_msg = str(e)
+        if "403" in err_msg:
+            raise YouTubeError(
+                "YouTube blocked audio stream download (HTTP 403 Forbidden). "
+                "Cloud datacenter IPs (like Streamlit Cloud) may require a cookies.txt file to download raw audio streams."
+            )
+        raise YouTubeError(f"Audio download failed: {clean_caption_text(err_msg)}")
     except Exception as e:
         logger.error(f"Unexpected audio download error: {e}", exc_info=True)
         raise YouTubeError(f"Audio extraction failed: {str(e)}")
